@@ -22,9 +22,9 @@ except ImportError:
 
 # --- ARGUMENT PARSING ---
 parser = argparse.ArgumentParser(description="MPC'den QP'ye ve GNN Graf Temsiline veri üretim pipeline'ı.")
-parser.add_argument("--num_train_samples", type=int, default=100,
+parser.add_argument("--num_train_samples", type=int, default=2000,
                     help="Eğitim için üretilecek toplam örnek sayısı (feasible/infeasible karışık).")
-parser.add_argument("--num_test_samples", type=int, default=20,
+parser.add_argument("--num_test_samples", type=int, default=1000,
                     help="Test için üretilecek toplam örnek sayısı (feasible/infeasible karışık).")
 parser.add_argument("--N", type=int, default=10, help="MPC Tahmin Ufku.")
 parser.add_argument("--nx", type=int, default=2, help="Durum değişkenlerinin sayısı.")
