@@ -84,14 +84,16 @@ def form_qp(F, G, Q_cost, R_cost, P_cost, umin_val, umax_val, xmin_val, xmax_val
     A_state_neg = -G # Boyut: (N*nx, N*nu)
 
     # Kontrol girdisi kısıtlamalarının A matrisi kısmı (I ve -I matrisleri)
-    A_control_pos = np.eye(N * nu) # Boyut: (N*nu, N*nu)
-    A_control_neg = -np.eye(N * nu) # Boyut: (N*nu, N*nu)
+    #A_control_pos = np.eye(N * nu) # Boyut: (N*nu, N*nu)
+    #A_control_neg = -np.eye(N * nu) # Boyut: (N*nu, N*nu)
 
     # Genel A_ineq matrisi: Durum ve kontrol kısıtları birleştirilir
-    A_ineq_combined = np.vstack((A_state_pos, A_state_neg, A_control_pos, A_control_neg))
+    #A_ineq_combined = np.vstack((A_state_pos, A_state_neg, A_control_pos, A_control_neg))
     # Toplam satır: 2*N*nx + 2*N*nu
     # Sütun: N*nu
-
+    A_ineq_combined = np.vstack((A_state_pos, A_state_neg))
+    # Toplam satır: 2*N*nx
+    # Sütun: N*nu (burası değişmez çünkü karar değişkenleri hala kontrol girişleridir)
     def bineq_x0(x0_current): # x0'ı x0_current olarak adlandırıldı
         # Durum kısıtlarının b vektörü kısmı
         # xmin_val ve xmax_val tekil değerler olduğundan, np.tile bunları doğru şekilde yayınlar
@@ -100,11 +102,13 @@ def form_qp(F, G, Q_cost, R_cost, P_cost, umin_val, umax_val, xmin_val, xmax_val
 
         # Kontrol girdisi kısıtlarının b vektörü kısmı
         # umin_val ve umax_val tekil değerler olduğundan
-        b_max_controls = np.tile(umax_val, (N * nu, 1)) # Boyut: (N*nu, 1)
-        b_min_controls = -np.tile(umin_val, (N * nu, 1)) # Boyut: (N*nu, 1)
+        #b_max_controls = np.tile(umax_val, (N * nu, 1)) # Boyut: (N*nu, 1)
+        #b_min_controls = -np.tile(umin_val, (N * nu, 1)) # Boyut: (N*nu, 1)
 
         # Genel b_ineq vektörü: Durum ve kontrol kısıtları birleştirilir
-        return np.vstack((b_max_states, b_min_states, b_max_controls, b_min_controls))
+        #return np.vstack((b_max_states, b_min_states, b_max_controls, b_min_controls))
+        return np.vstack((b_max_states, b_min_states))
+
         # Toplam satır: 2*N*nx + 2*N*nu
         # Sütun: 1
 
