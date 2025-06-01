@@ -4,55 +4,41 @@ import tensorflow as tf
 import argparse
 import os
 # QPGNNPolicy modelinizi içeren dosya adını doğru bir şekilde buraya girin.
-# Eğer models.py dosyanızın adı 'models.py' ise, sadece 'models' olarak içe aktarın.
-# Eğer 'qp_models.py' ise, 'qp_models' olarak içe aktarın.
-from models import QPGNNPolicy # Varsayılan olarak models.py'yi kullanıyorum
+from models import QPGNNPolicy
 
 ## ARGUMENTS OF THE SCRIPT
 parser = argparse.ArgumentParser(description="QP GNN Modelini Eğitme Betiği.")
-parser.add_argument("--data_folder", help="Eğitim veri setinin ana klasörü (örn: ./train_data)", default="./train_data", type=str)
-parser.add_argument("--val_data_folder", help="Doğrulama veri setinin ana klasörü (örn: ./test_data)", default="./test_data", type=str) # Test verisi artık doğrulama için kullanılacak
-parser.add_argument("--total_samples", help="Toplam eğitim + doğrulama örnek sayısı (veri klasöründe kaç adet Data_X var).", default=100, type=int) # args.data yerine total_samples oldu
+parser.add_argument("--data_folder", help="Eğitim veri setinin ana klasörü", default="./train_data", type=str)
+parser.add_argument("--val_data_folder", help="Doğrulama veri setinin ana klasörü", default="./test_data", type=str)
+parser.add_argument("--total_samples", help="Toplam eğitim + doğrulama örnek sayısı", default=100, type=int)
+parser.add_argument("--num_train_samples", help="Eğitim için kullanılacak örnek sayısı", default=80, type=int)
+parser.add_argument("--num_test_samples", help="Test/doğrulama için kullanılacak örnek sayısı", default=20, type=int)
 parser.add_argument("--gpu", help="Kullanılacak GPU indeksi", default="0", type=str)
 parser.add_argument("--embSize", help="GNN'nin gömme boyutu", default=64, type=int)
 parser.add_argument("--epoch", help="Maksimum epoch sayısı", default=500, type=int)
 parser.add_argument("--type", help="Model tipi: 'fea' (fizibilite), 'obj' (amaç değeri), 'sol' (çözüm)", default="fea", choices=['fea','obj','sol'])
-parser.add_argument("--valSplit", help="Doğrulama için verinin oranı (0~1). Not: Şimdi ayrı klasörler kullanıldığı için bu argüman daha az doğrudan etkilidir, ancak tutarlılık için tutulabilir.", default=0.2, type=float)
+parser.add_argument("--valSplit", help="Doğrulama için verinin oranı (0~1)", default=0.2, type=float)
 parser.add_argument("--dropout", help="Dropout oranı", default=0.0, type=float)
 parser.add_argument("--weightDecay", help="AdamW için ağırlık azaltma oranı", default=0.0, type=float)
-parser.add_argument("--patience", help="Erken durdurma sabrı (kaç epoch iyileşme olmazsa durulacak)", default=300, type=int)
+parser.add_argument("--patience", help="Erken durdurma sabrı", default=300, type=int)
+parser.add_argument("--N", help="Zaman ufku uzunluğu", default=10, type=int)
+parser.add_argument("--nx", help="Durum değişkeni sayısı", default=2, type=int)
+parser.add_argument("--nu", help="Kontrol değişkeni sayısı", default=1, type=int)
 args = parser.parse_args()
 
 ## HELPER FUNCTIONS
 def relative_loss(y_true, y_pred):
-    """
-    Göreceli mutlak hata: |y_true - y_pred| / (|y_true| + epsilon)
-    Büyük objektif değerleri için daha dengeli bir eğitim sağlar.
-    """
-    epsilon = 1e-6 # Sıfıra bölmeyi önlemek için daha küçük bir epsilon değeri
+    epsilon = 1e-6
     return tf.reduce_mean(tf.abs(y_true - y_pred) / (tf.abs(y_true) + epsilon))
 
-def normalized_euclidean_loss(y_true, y_pred, n_Vars_small):
+def solution_mse_loss(y_true, y_pred):
     """
-    Normalize edilmiş Euclidean mesafe loss fonksiyonu.
-    Çözüm vektörlerinin tahmininde daha anlamlı bir metrik.
+    Solution modeli için basit MSE loss.
+    Super-graph sorununu MSE ile çözüyoruz.
     """
-    # y_true ve y_pred batch_size * n_Vars_small, 1 boyutunda gelir
-    # Her bir örnek için ayrı ayrı yeniden şekillendirip norm hesaplamalıyız
-    batch_size = tf.shape(y_true)[0] // n_Vars_small
-    y_true_reshaped = tf.reshape(y_true, [batch_size, n_Vars_small])
-    y_pred_reshaped = tf.reshape(y_pred, [batch_size, n_Vars_small])
-    
-    distances = tf.norm(y_true_reshaped - y_pred_reshaped, axis=1) # tf.norm Euclidean norm için
-    norms = tf.norm(y_true_reshaped, axis=1) + 1e-6 # Sıfıra bölmeyi önlemek için küçük epsilon
-    return tf.reduce_mean(distances / norms)
+    return tf.reduce_mean(tf.square(y_true - y_pred))
 
-# Veri yükleme fonksiyonu
 def load_and_batch_data(folder_path, n_samples, n_Cons_small, n_Vars_small, load_solution_labels=True, model_type='fea'):
-    """
-    Veri klasöründen graf verilerini yükler ve GNN modelinin beklediği formata hazırlar.
-    Bu, bir minibatch için tüm graf örneklerini birleştiren bir "super-graph" oluşturur.
-    """
     varFeatures_list = []
     conFeatures_list = []
     edgFeatures_A_list = []
@@ -61,14 +47,13 @@ def load_and_batch_data(folder_path, n_samples, n_Cons_small, n_Vars_small, load
     q_edgIndices_H_list = []
     labels_list = []
 
-    # Her bir graf örneği için düğüm ve kenar indeks ofsetlerini takip etmek için
     var_node_offset = 0
     con_node_offset = 0
 
     for i in range(n_samples):
         instance_dir = os.path.join(folder_path, f"Data_{i}")
         
-        # Fizibilite etiketini kontrol et, yoksa veya 0 ise atla
+        # Fizibilite etiketini kontrol et
         feas_path = os.path.join(instance_dir, "Labels_feas.csv")
         if not os.path.exists(feas_path):
             print(f"Uyarı: {feas_path} bulunamadı, örnek {i} atlanıyor.")
@@ -80,49 +65,48 @@ def load_and_batch_data(folder_path, n_samples, n_Cons_small, n_Vars_small, load
         if model_type in ["obj", "sol"] and is_feasible == 0:
             continue
         
-        # Fizibilite modeli ise, Labels_feas her zaman okunur
-        # Obj veya Sol modeli ise, sadece fizibil olanlar okunur
+        # Label'ları oku
         if model_type == "fea":
-            labels_data = np.array([[is_feasible]]) # Labels_feas.csv'den oku
+            labels_data = np.array([[is_feasible]])
         elif model_type == "obj":
             obj_path = os.path.join(instance_dir, "Labels_obj.csv")
-            if not os.path.exists(obj_path): # Eğer fizibil değilse obj dosyası olmazdı
+            if not os.path.exists(obj_path):
                 continue 
             labels_data = read_csv(obj_path, header=None).values
         elif model_type == "sol":
             solu_path = os.path.join(instance_dir, "Labels_solu.csv")
-            if not os.path.exists(solu_path): # Eğer fizibil değilse solu dosyası olmazdı
+            if not os.path.exists(solu_path):
                 continue
             labels_data = read_csv(solu_path, header=None).values
 
-
+        # GNN dosyaları iç Data_X klasöründe
+        gnn_data_dir = os.path.join(instance_dir, f"Data_{i}")
+        
         # Verileri oku
         try:
-            var_features = read_csv(os.path.join(instance_dir, "VarFeatures.csv"), header=None).values
-            con_features = read_csv(os.path.join(instance_dir, "ConFeatures.csv"), header=None).values
-            edg_features_A = read_csv(os.path.join(instance_dir, "EdgeFeatures_A.csv"), header=None).values
-            edg_indices_A = read_csv(os.path.join(instance_dir, "EdgeIndices_A.csv"), header=None).values
-            q_edg_features_H = read_csv(os.path.join(instance_dir, "QEdgeFeatures.csv"), header=None).values
-            q_edg_indices_H = read_csv(os.path.join(instance_dir, "QEdgeIndices.csv"), header=None).values
+            var_features = read_csv(os.path.join(gnn_data_dir, "VarFeatures.csv"), header=None).values
+            con_features = read_csv(os.path.join(gnn_data_dir, "ConFeatures.csv"), header=None).values
+            edg_features_A = read_csv(os.path.join(gnn_data_dir, "EdgeFeatures_A.csv"), header=None).values
+            edg_indices_A = read_csv(os.path.join(gnn_data_dir, "EdgeIndices_A.csv"), header=None).values
+            q_edg_features_H = read_csv(os.path.join(gnn_data_dir, "QEdgeFeatures.csv"), header=None).values
+            q_edg_indices_H = read_csv(os.path.join(gnn_data_dir, "QEdgeIndices.csv"), header=None).values
         except FileNotFoundError as e:
             print(f"Hata: {e}. Örnek {i} için dosya bulunamadı, atlanıyor.")
             continue
         
-        # Boyut kontrolleri (Super-graph oluşturmak için önemli)
+        # Boyut kontrolleri
         if (var_features.shape[0] != n_Vars_small or 
             con_features.shape[0] != n_Cons_small or 
-            edg_indices_A.shape[0] != n_Cons_small * n_Vars_small or # m*n kenar
-            q_edg_indices_H.shape[0] != n_Vars_small * n_Vars_small): # n*n kenar
+            edg_indices_A.shape[0] != n_Cons_small * n_Vars_small or
+            q_edg_indices_H.shape[0] != n_Vars_small * n_Vars_small):
             print(f"Uyarı: Örnek {i} için beklenen boyutlar eşleşmiyor, atlanıyor.")
             print(f"Beklenen: var_feats={n_Vars_small}, con_feats={n_Cons_small}, A_edges={n_Cons_small*n_Vars_small}, H_edges={n_Vars_small*n_Vars_small}")
             print(f"Bulunan: var_feats={var_features.shape[0]}, con_feats={con_features.shape[0]}, A_edges={edg_indices_A.shape[0]}, H_edges={q_edg_indices_H.shape[0]}")
             continue
 
-
-        # Kenar indekslerini her örnek için kaydır (super-graph oluşturmak için)
+        # Kenar indekslerini kaydır (super-graph için)
         edg_indices_A_offset = edg_indices_A + [con_node_offset, var_node_offset]
-        q_edg_indices_H_offset = q_edg_indices_H + [var_node_offset, var_node_offset] # Q edges sadece var'dan var'a
-
+        q_edg_indices_H_offset = q_edg_indices_H + [var_node_offset, var_node_offset]
 
         varFeatures_list.append(var_features)
         conFeatures_list.append(con_features)
@@ -133,85 +117,68 @@ def load_and_batch_data(folder_path, n_samples, n_Cons_small, n_Vars_small, load
         labels_list.append(labels_data)
 
         # Ofsetleri güncelle
-        var_node_offset += var_features.shape[0] # Her bir grafikteki değişken sayısı
-        con_node_offset += con_features.shape[0] # Her bir grafikteki kısıt sayısı
+        var_node_offset += var_features.shape[0]
+        con_node_offset += con_features.shape[0]
     
-    if not varFeatures_list: # Hiç veri yüklenemedi mi kontrol et
+    if not varFeatures_list:
         print(f"Uyarı: {folder_path} klasöründen hiç geçerli veri yüklenemedi. Program sonlandırılıyor.")
         exit(1)
 
-
-    # Tüm listeleri tek NumPy dizilerine birleştir
+    # Tüm listeleri birleştir
     varFeatures_all = np.vstack(varFeatures_list)
     conFeatures_all = np.vstack(conFeatures_list)
     edgFeatures_A_all = np.vstack(edgFeatures_A_list)
     edgIndices_A_all = np.vstack(edgIndices_A_list)
     q_edgFeatures_H_all = np.vstack(q_edgFeatures_H_list)
     q_edgIndices_H_all = np.vstack(q_edgIndices_H_list)
-    labels_all = np.vstack(labels_list) # label'lar zaten tek değer veya vektör olarak gelir
+    labels_all = np.vstack(labels_list)
 
     # TensorFlow tensörlerine dönüştür
     varFeatures_tf = tf.constant(varFeatures_all, dtype=tf.float32)
     conFeatures_tf = tf.constant(conFeatures_all, dtype=tf.float32)
     edgFeatures_A_tf = tf.constant(edgFeatures_A_all, dtype=tf.float32)
-    edgIndices_A_tf = tf.transpose(tf.constant(edgIndices_A_all, dtype=tf.int32)) # Transpoze GNN formatı için
+    edgIndices_A_tf = tf.transpose(tf.constant(edgIndices_A_all, dtype=tf.int32))
     q_edgFeatures_H_tf = tf.constant(q_edgFeatures_H_all, dtype=tf.float32)
-    q_edgIndices_H_tf = tf.transpose(tf.constant(q_edgIndices_H_all, dtype=tf.int32)) # Transpoze GNN formatı için
+    q_edgIndices_H_tf = tf.transpose(tf.constant(q_edgIndices_H_all, dtype=tf.int32))
     labels_tf = tf.constant(labels_all, dtype=tf.float32)
 
-    # Toplu graf boyutları
+    # Batch boyutları
     n_cons_total_batch = tf.constant(conFeatures_all.shape[0], dtype=tf.int32)
     n_vars_total_batch = tf.constant(varFeatures_all.shape[0], dtype=tf.int32)
 
-    # Modülün beklediği demet formatı
     dataloader_tuple = (
         conFeatures_tf, edgIndices_A_tf, edgFeatures_A_tf,
         varFeatures_tf, q_edgIndices_H_tf, q_edgFeatures_H_tf,
         n_cons_total_batch, n_vars_total_batch,
-        tf.constant(n_Cons_small, dtype=tf.int32), # Her bir grafikteki kısıt sayısı
-        tf.constant(n_Vars_small, dtype=tf.int32), # Her bir grafikteki değişken sayısı
+        tf.constant(n_Cons_small, dtype=tf.int32),
+        tf.constant(n_Vars_small, dtype=tf.int32),
         labels_tf
     )
     return dataloader_tuple
 
-
 def process_train_step(model, dataloader, optimizer, type='fea'):
-    """Tek bir eğitim adımını işler."""
-    # Dataloader'dan verileri aç
     c, ei, ev, v, qi, qv, n_cs, n_vs, n_csm, n_vsm, cand_scores = dataloader
     batched_states = (c, ei, ev, v, qi, qv, n_cs, n_vs, n_csm, n_vsm)
 
     with tf.GradientTape() as tape:
-        # training=True => Dropout aktif
         logits = model(batched_states, training=True)
         
-        # Farklı model tipleri için farklı loss fonksiyonları
         if type == "obj":
             loss = relative_loss(cand_scores, logits)
         elif type == "sol":
-            # n_vsm (n_Vars_small) argüman olarak geçirilmelidir
-            loss = normalized_euclidean_loss(cand_scores, logits, n_Vars_small=n_vsm) 
+            # Solution için basit MSE loss kullan
+            loss = solution_mse_loss(cand_scores, logits)
         else: # type == "fea"
-            # Fizibilite için genellikle Binary Crossentropy kullanılır, ancak orijinal kod MSE kullanmış.
-            # Binary Crossentropy için logits sigmoid aktivasyonlu olmalı.
-            # Eğer model çıktısı sigmoid ise tf.keras.losses.BinaryCrossentropy(from_logits=False)
-            # Eğer model çıktısı raw logits ise tf.keras.losses.BinaryCrossentropy(from_logits=True)
-            # Şu anki modelde `output_activation=None` ve `output_units=1` olduğu için MSE'ye devam edelim.
-            # Eğer sigmoid eklenecekse BinaryCrossentropy daha uygun olur.
-            loss_tensor = tf.keras.losses.mean_squared_error(cand_scores, logits)
-            loss = tf.reduce_mean(loss_tensor)
+            loss = tf.reduce_mean(tf.square(cand_scores - logits))
     
     grads = tape.gradient(loss, model.trainable_variables)
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
 
     err_rate = None
     if type == "fea":
-        # Sınıflandırma hatasını hesapla (accuracy)
-        # Logits'i (0,1) aralığına sıkıştırıp 0.5 eşiğiyle sınıflandırma yap
-        logits_sigmoid = tf.sigmoid(logits).numpy() # Eğer modelin son katmanında sigmoid yoksa
+        logits_sigmoid = tf.sigmoid(logits).numpy()
         cand_scores_np = cand_scores.numpy()
         
-        # Hataları hesapla: Yanlış pozitifler ve yanlış negatifler
         errs_fp = np.sum((logits_sigmoid > 0.5) & (cand_scores_np < 0.5))
         errs_fn = np.sum((logits_sigmoid < 0.5) & (cand_scores_np > 0.5))
         total_errs = errs_fp + errs_fn
@@ -220,26 +187,22 @@ def process_train_step(model, dataloader, optimizer, type='fea'):
     return loss.numpy(), err_rate
 
 def process_eval(model, dataloader, type='fea'):
-    """Tek bir değerlendirme adımını işler."""
     c, ei, ev, v, qi, qv, n_cs, n_vs, n_csm, n_vsm, cand_scores = dataloader
     batched_states = (c, ei, ev, v, qi, qv, n_cs, n_vs, n_csm, n_vsm)
     
-    # training=False => Dropout inaktif
     logits = model(batched_states, training=False)
     
-    # Farklı model tipleri için farklı loss fonksiyonları
     if type == "obj":
         loss = relative_loss(cand_scores, logits)
     elif type == "sol":
-        loss = normalized_euclidean_loss(cand_scores, logits, n_Vars_small=n_vsm)
+        # Solution için basit MSE loss kullan
+        loss = solution_mse_loss(cand_scores, logits)
     else: # type == "fea"
-        loss_tensor = tf.keras.losses.mean_squared_error(cand_scores, logits)
-        loss = tf.reduce_mean(loss_tensor)
+        loss = tf.reduce_mean(tf.square(cand_scores - logits))
 
     err_rate = None
     if type == "fea":
-        # Sınıflandırma hatasını hesapla
-        logits_sigmoid = tf.sigmoid(logits).numpy() # Eğer modelin son katmanında sigmoid yoksa
+        logits_sigmoid = tf.sigmoid(logits).numpy()
         cand_scores_np = cand_scores.numpy()
         errs_fp = np.sum((logits_sigmoid > 0.5) & (cand_scores_np < 0.5))
         errs_fn = np.sum((logits_sigmoid < 0.5) & (cand_scores_np > 0.5))
@@ -252,29 +215,43 @@ def process_eval(model, dataloader, type='fea'):
 max_epochs = args.epoch
 lr = 0.0003
 seed = 0
-val_split = args.valSplit # Artık doğrudan klasör ayrımı olduğu için bu argüman daha az kritik
+val_split = args.valSplit
 weight_decay = args.weightDecay
 dropout_rate = args.dropout
 patience = args.patience
 
 ## DATASET SETUP
-trainfolder = args.data_folder # './train_data'
-valfolder = args.val_data_folder # './test_data'
+trainfolder = args.data_folder
+valfolder = args.val_data_folder
 
-# Sabit olarak her bir grafikteki kısıt ve değişken sayıları
-# Bunlar veri üretiminizdeki N ve nx, nu değerlerinden türetilmelidir.
-# N = 10, nx = 2, nu = 1 varsayımıyla:
-n_Cons_small = 2 * args.N * args.nx + 2 * args.N * args.nu # 2*10*2 + 2*10*1 = 40 + 20 = 60
-n_Vars_small = args.N * args.nu # 10*1 = 10
-
-# Kenar sayıları dinamik olarak okunur, ancak ortalama bir değer belirtmek iyidir.
-# Yoğun graf temsili kullandığımız için:
-n_Eles_small_A = n_Cons_small * n_Vars_small # 60 * 10 = 600
-n_Eles_small_H = n_Vars_small * n_Vars_small # 10 * 10 = 100
+# Gerçek veri boyutlarını otomatik algıla
+sample_gnn_dir = os.path.join(args.data_folder, "Data_0", "Data_0")
+try:
+    sample_var = read_csv(os.path.join(sample_gnn_dir, "VarFeatures.csv"), header=None)
+    sample_con = read_csv(os.path.join(sample_gnn_dir, "ConFeatures.csv"), header=None)
+    sample_edge_A = read_csv(os.path.join(sample_gnn_dir, "EdgeIndices_A.csv"), header=None)
+    sample_qedge_H = read_csv(os.path.join(sample_gnn_dir, "QEdgeIndices.csv"), header=None)
+    
+    n_Vars_small = sample_var.shape[0]
+    n_Cons_small = sample_con.shape[0]
+    n_Eles_small_A = sample_edge_A.shape[0]
+    n_Eles_small_H = sample_qedge_H.shape[0]
+    
+    print(f'Gerçek veri boyutları (otomatik algılandı):')
+    print(f'  Variables per graph: {n_Vars_small}')
+    print(f'  Constraints per graph: {n_Cons_small}')
+    print(f'  A edges per graph: {n_Eles_small_A}')
+    print(f'  H edges per graph: {n_Eles_small_H}')
+    
+except FileNotFoundError as e:
+    print(f"Uyarı: Otomatik boyut algılama başarısız: {e}")
+    print("Manuel boyutlar kullanılıyor...")
+    n_Vars_small = 10
+    n_Cons_small = 40
+    n_Eles_small_A = 400
+    n_Eles_small_H = 100
 
 ## LOAD DATASET INTO MEMORY
-# load_and_batch_data fonksiyonu, tüm veriyi memory'ye yükler
-# Büyük veri setleri için tf.data.Dataset kullanılmalı, ancak küçük/orta için bu uygun
 train_dataloader = load_and_batch_data(
     args.data_folder, args.num_train_samples, n_Cons_small, n_Vars_small, 
     load_solution_labels=True, model_type=args.type
@@ -284,9 +261,8 @@ val_dataloader = load_and_batch_data(
     load_solution_labels=True, model_type=args.type
 )
 
-# Debug: Veri yükleme sonrası boyutları kontrol et
 if train_dataloader is None or val_dataloader is None:
-    print("Hata: Veri yükleme başarısız oldu. Lütfen klasör yollarını ve örnek sayılarını kontrol edin.")
+    print("Hata: Veri yükleme başarısız oldu.")
     exit(1)
 
 print('Train data shapes (after loading and batching):')
@@ -302,7 +278,7 @@ print(f'  Constraints per graph: {train_dataloader[8].numpy()}')
 print(f'  Variables per graph: {train_dataloader[9].numpy()}')
 print(f'  Labels: {train_dataloader[10].shape}')
 
-print('\nValidation data shapes (after loading and batching):')
+print('\nValidation data shapes:')
 print(f'  Constraint features: {val_dataloader[0].shape}')
 print(f'  Edge indices A: {val_dataloader[1].shape}')
 print(f'  Edge features A: {val_dataloader[2].shape}')
@@ -315,25 +291,48 @@ print(f'  Constraints per graph: {val_dataloader[8].numpy()}')
 print(f'  Variables per graph: {val_dataloader[9].numpy()}')
 print(f'  Labels: {val_dataloader[10].shape}')
 
+# Feature boyutlarını al
+sample_dir = os.path.join(args.data_folder, "Data_0", "Data_0")
+try:
+    sample_var = read_csv(os.path.join(sample_dir, "VarFeatures.csv"), header=None)
+    sample_con = read_csv(os.path.join(sample_dir, "ConFeatures.csv"), header=None)
+    sample_edge_A = read_csv(os.path.join(sample_dir, "EdgeFeatures_A.csv"), header=None)
+    sample_qedge_H = read_csv(os.path.join(sample_dir, "QEdgeFeatures.csv"), header=None)
+    
+    nVarF = sample_var.shape[1]
+    nConsF = sample_con.shape[1] 
+    nEdgeF = sample_edge_A.shape[1]
+    nQEdgeF = sample_qedge_H.shape[1]
+    
+    print(f'\nFeature dimensions:')
+    print(f'  Variable features: {nVarF}')
+    print(f'  Constraint features: {nConsF}')
+    print(f'  Edge features A: {nEdgeF}')
+    print(f'  QEdge features H: {nQEdgeF}')
+    
+except FileNotFoundError:
+    nVarF = 4
+    nConsF = 4
+    nEdgeF = 1
+    nQEdgeF = 1
 
-## SETUP MODEL AND SAVED MODEL PATH
+## SETUP MODEL
 if not os.path.exists('./saved-models/'):
     os.makedirs('./saved-models/')
 model_path = './saved-models/qp_' + args.type + '_s' + str(args.embSize) + '.pkl'
 
-# Model output units and activation based on type
+# Model parameters
 output_units = 1
-output_activation = None # default for obj and sol
+output_activation = None
 
 if args.type == "fea":
-    output_activation = 'sigmoid' # Feasibility is binary classification
+    output_activation = 'sigmoid'
 elif args.type == "sol":
-    output_units = n_Vars_small # Solution is a vector of size n_Vars_small
-    output_activation = None # Solution is real-valued, no activation
+    output_units = n_Vars_small
+    output_activation = None
 elif args.type == "obj":
-    output_units = 1 # Objective is a single real value
-    output_activation = None # Objective is real-valued, no activation
-
+    output_units = 1
+    output_activation = None
 
 ## SETUP TENSORFLOW GPU
 tf.random.set_seed(seed)
@@ -341,19 +340,25 @@ gpu_index = int(args.gpu)
 tf.config.set_soft_device_placement(True)
 gpus = tf.config.list_physical_devices('GPU')
 if len(gpus) > 0:
-    tf.config.set_visible_devices(gpus[gpu_index], 'GPU')
-    tf.config.experimental.set_memory_growth(gpus[gpu_index], True)
+    try:
+        tf.config.set_visible_devices(gpus[gpu_index], 'GPU')
+        tf.config.experimental.set_memory_growth(gpus[gpu_index], True)
+        print(f"GPU {gpu_index} yapılandırıldı: {gpus[gpu_index].name}")
+    except RuntimeError as e:
+        print(f"GPU ayarı atlandı (zaten yapılandırılmış): {e}")
+else:
+    print("GPU bulunamadı, CPU kullanılacak")
 
 ## MAIN TRAINING LOOP
 with tf.device("GPU:" + str(gpu_index) if len(gpus) > 0 else "/CPU:0"):
-    # Create model instance
+    # Create model
     model = QPGNNPolicy(
         emb_size=args.embSize,
         cons_nfeats=nConsF,
         edge_nfeats=nEdgeF,
         var_nfeats=nVarF,
         qedge_nfeats=nQEdgeF,
-        is_graph_level=(args.type != "sol"), # isGraphLevel True for fea/obj, False for sol
+        is_graph_level=(args.type != "sol"),
         output_units=output_units,
         output_activation=output_activation,
         dropout_rate=dropout_rate
@@ -366,10 +371,17 @@ with tf.device("GPU:" + str(gpu_index) if len(gpus) > 0 else "/CPU:0"):
         print("AdamW optimizer not available, using standard Adam optimizer")
         optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
 
-    # Initialize variables for early stopping
+    # Early stopping variables
     best_val_loss = float('inf')
     wait = 0
     best_epoch = 0
+
+    print(f"\n🚀 Eğitim başlıyor...")
+    print(f"Model tipi: {args.type}")
+    print(f"Embedding boyutu: {args.embSize}")
+    print(f"Maksimum epoch: {max_epochs}")
+    print(f"Sabır (patience): {patience}")
+    print("-" * 80)
 
     # Training loop
     for epoch in range(max_epochs):
@@ -400,4 +412,6 @@ with tf.device("GPU:" + str(gpu_index) if len(gpus) > 0 else "/CPU:0"):
                 print(f"  ✓ Best model was at epoch {best_epoch} with val_loss={best_val_loss:.6f}")
                 break
 
-    print(f"Training completed. Best validation loss: {best_val_loss:.6f} at epoch {best_epoch}")
+    print("-" * 80)
+    print(f"🎉 Eğitim tamamlandı!")
+    print(f"En iyi doğrulama kaybı: {best_val_loss:.6f} (epoch {best_epoch})")
