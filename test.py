@@ -1,3 +1,4 @@
+# test_fixed.py - Yeni veri formatına uyarlanmış
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -12,18 +13,24 @@ from pandas import read_csv
 from models import QPGNNPolicy
 
 ## ARGUMENTS
-parser = argparse.ArgumentParser(description="QP GNN Model Test Script")
+parser = argparse.ArgumentParser(description="QP GNN Model Test Script - Fixed")
 parser.add_argument("--test_data_folder", help="Test veri klasörü", default="./test_data", type=str)
-parser.add_argument("--model_folder", help="Kaydedilmiş modeller klasörü", default="./saved-models", type=str)
+parser.add_argument("--model_folder", help="Kaydedilmiş modeller klasörü", default="./saved_models", type=str)
 parser.add_argument("--num_test_samples", help="Test edilecek örnek sayısı", default=100, type=int)
 parser.add_argument("--gpu", help="GPU indeksi (-1 for CPU)", default="0", type=str)
+parser.add_argument("--model_type", help="Test edilecek model tipi", default="sol", choices=['fea','obj','sol'])
 parser.add_argument("--save_results", help="Sonuçları kaydet", action="store_true")
 parser.add_argument("--verbose", help="Detaylı çıktı", action="store_true")
+# Model parametreleri
+parser.add_argument("--N", help="MPC Horizon", default=10, type=int)
+parser.add_argument("--nx", help="Number of states", default=2, type=int)
+parser.add_argument("--nu", help="Number of controls", default=1, type=int)
+parser.add_argument("--emb_size", help="Model embedding size", default=32, type=int)
 args = parser.parse_args()
 
 class QPModelTester:
     def __init__(self):
-        self.models = {}
+        self.model = None
         self.test_data = None
         self.results = {}
         
@@ -59,7 +66,8 @@ class QPModelTester:
     
     def detect_data_dimensions(self):
         """Veri boyutlarını otomatik algıla"""
-        sample_dir = os.path.join(args.test_data_folder, "Data_0", "Data_0")
+        # YENİ FORMAT: Data_0/VarFeatures.csv (Data_0/Data_0/VarFeatures.csv DEĞİL)
+        sample_dir = os.path.join(args.test_data_folder, "Data_0")
         try:
             sample_var = read_csv(os.path.join(sample_dir, "VarFeatures.csv"), header=None)
             sample_con = read_csv(os.path.join(sample_dir, "ConFeatures.csv"), header=None)
@@ -83,100 +91,114 @@ class QPModelTester:
             
         except FileNotFoundError as e:
             print(f"❌ Veri boyutu algılama hatası: {e}")
-            # Varsayılan değerler
-            self.n_Vars_small = 10
-            self.n_Cons_small = 40
+            # Varsayılan değerler - args'dan al
+            self.n_Vars_small = args.N * args.nu
+            self.n_Cons_small = 2 * args.N * args.nx
             self.nVarF = 3
             self.nConsF = 2
             self.nEdgeF = 1
             self.nQEdgeF = 1
             print("🔧 Varsayılan boyutlar kullanılıyor")
     
-    def load_models(self):
-        """Kaydedilmiş modelleri yükle"""
-        model_types = ['fea', 'obj', 'sol']
+    def load_model(self):
+        """Kaydedilmiş modeli yükle"""
         device = self.setup_gpu()
         
         with tf.device(device):
-            for model_type in model_types:
-                # Farklı embedding boyutlarını dene
-                for emb_size in [32, 64, 128]:
-                    # Farklı model dosya uzantılarını dene
-                    for ext in ['.pkl', '.h5', '.ckpt']:
-                        model_path = os.path.join(args.model_folder, f"qp_{model_type}_s{emb_size}{ext}")
-                        
-                        if os.path.exists(model_path):
-                            try:
-                                # Model parametrelerini ayarla
-                                output_units = 1
-                                output_activation = None
-                                
-                                if model_type == "fea":
-                                    output_activation = 'sigmoid'
-                                elif model_type == "sol":
-                                    output_units = self.n_Vars_small
-                                    output_activation = None
-                                elif model_type == "obj":
-                                    output_units = 1
-                                    output_activation = None
-                                
-                                # Model oluştur
-                                model = QPGNNPolicy(
-                                    emb_size=emb_size,
-                                    cons_nfeats=self.nConsF,
-                                    edge_nfeats=self.nEdgeF,
-                                    var_nfeats=self.nVarF,
-                                    qedge_nfeats=self.nQEdgeF,
-                                    is_graph_level=(model_type != "sol"),
-                                    output_units=output_units,
-                                    output_activation=output_activation,
-                                    dropout_rate=0.0
-                                )
-                                
-                                # Dummy forward pass to build model
-                                dummy_input = (
-                                    tf.zeros((self.n_Cons_small, self.nConsF)),
-                                    tf.zeros((2, self.n_Cons_small * self.n_Vars_small), dtype=tf.int32),
-                                    tf.zeros((self.n_Cons_small * self.n_Vars_small, self.nEdgeF)),
-                                    tf.zeros((self.n_Vars_small, self.nVarF)),
-                                    tf.zeros((2, self.n_Vars_small * self.n_Vars_small), dtype=tf.int32),
-                                    tf.zeros((self.n_Vars_small * self.n_Vars_small, self.nQEdgeF)),
-                                    tf.constant(self.n_Cons_small, dtype=tf.int32),
-                                    tf.constant(self.n_Vars_small, dtype=tf.int32),
-                                    tf.constant(self.n_Cons_small, dtype=tf.int32),
-                                    tf.constant(self.n_Vars_small, dtype=tf.int32)
-                                )
-                                _ = model(dummy_input, training=False)
-                                
-                                # Model ağırlıklarını yükle - farklı yöntemler dene
-                                if ext == '.pkl':
-                                    try:
-                                        model.restore_state(model_path)  # ✅ Doğru metod adı!
-                                    except AttributeError:
-                                        print(f"⚠️  restore_state metodu bulunamadı: {model_path}")
-                                        continue
-                                elif ext == '.h5':
-                                    model.load_weights(model_path)
-                                elif ext == '.ckpt':
-                                    checkpoint = tf.train.Checkpoint(model=model)
-                                    checkpoint.restore(model_path)
-                                
-                                self.models[model_type] = model
-                                print(f"✅ {model_type.upper()} model yüklendi (emb_size={emb_size}, format={ext})")
-                                break
-                                
-                            except Exception as e:
-                                if args.verbose:
-                                    print(f"⚠️  {model_path} yüklenemedi: {e}")
-                                continue
-                        
-                    if model_type in self.models:
+            # Model klasörü
+            model_base_name = f"qp_{args.model_type}_emb{args.emb_size}_N{args.N}nx{args.nx}nu{args.nu}"
+            model_dir = os.path.join(args.model_folder, model_base_name)
+            model_path = tf.train.latest_checkpoint(model_dir)
+            
+            print(f"🔍 Model aranıyor: {model_dir}")
+            
+            if model_path is None:
+                print(f"❌ Checkpoint bulunamadı: {model_dir}")
+                # Alternatif path'leri dene
+                alt_paths = [
+                    os.path.join(args.model_folder, f"qp_{args.model_type}_s{args.emb_size}.pkl"),
+                    os.path.join(args.model_folder, f"qp_{args.model_type}_emb{args.emb_size}.ckpt"),
+                ]
+                
+                for alt_path in alt_paths:
+                    if os.path.exists(alt_path):
+                        model_path = alt_path
+                        print(f"✅ Alternatif model bulundu: {model_path}")
                         break
-                    
-                if model_type not in self.models:
-                    print(f"❌ {model_type.upper()} model bulunamadı!")
-        
-        print(f"📦 Toplam {len(self.models)} model yüklendi")
+                else:
+                    print("❌ Hiç model bulunamadı!")
+                    return False
+            else:
+                print(f"✅ Checkpoint bulundu: {model_path}")
+            
+            try:
+                # Model parametrelerini ayarla
+                output_units = 1
+                output_activation = None
+                
+                if args.model_type == "fea":
+                    output_activation = 'sigmoid'
+                elif args.model_type == "sol":
+                    output_units = self.n_Vars_small
+                    output_activation = None
+                elif args.model_type == "obj":
+                    output_units = 1
+                    output_activation = None
+                
+                # Model oluştur
+                self.model = QPGNNPolicy(
+                    emb_size=args.emb_size,
+                    cons_nfeats=self.nConsF,
+                    edge_nfeats=self.nEdgeF,
+                    var_nfeats=self.nVarF,
+                    qedge_nfeats=self.nQEdgeF,
+                    is_graph_level=(args.model_type != "sol"),
+                    output_units=output_units,
+                    output_activation=output_activation,
+                    dropout_rate=0.0
+                )
+                
+                # Dummy forward pass to build model
+                dummy_input = (
+                    tf.zeros((self.n_Cons_small, self.nConsF)),
+                    tf.zeros((2, self.n_Cons_small * self.n_Vars_small), dtype=tf.int32),
+                    tf.zeros((self.n_Cons_small * self.n_Vars_small, self.nEdgeF)),
+                    tf.zeros((self.n_Vars_small, self.nVarF)),
+                    tf.zeros((2, self.n_Vars_small * self.n_Vars_small), dtype=tf.int32),
+                    tf.zeros((self.n_Vars_small * self.n_Vars_small, self.nQEdgeF)),
+                    tf.constant(self.n_Cons_small, dtype=tf.int32),
+                    tf.constant(self.n_Vars_small, dtype=tf.int32),
+                    tf.constant(self.n_Cons_small, dtype=tf.int32),
+                    tf.constant(self.n_Vars_small, dtype=tf.int32)
+                )
+                _ = self.model(dummy_input, training=False)
+                
+                # Model ağırlıklarını yükle
+                if model_path.endswith('.pkl'):
+                    # Eski format
+                    if hasattr(self.model, 'restore_state'):
+                        self.model.restore_state(model_path)
+                    else:
+                        print("⚠️  restore_state metodu bulunamadı")
+                        return False
+                else:
+                    # TensorFlow checkpoint format
+                    checkpoint = tf.train.Checkpoint(model=self.model)
+                    status = checkpoint.restore(model_path)
+                    if hasattr(status, 'expect_partial'):
+                        status.expect_partial()
+                
+                print(f"✅ {args.model_type.upper()} model başarıyla yüklendi!")
+                print(f"   Embedding size: {args.emb_size}")
+                print(f"   Output units: {output_units}")
+                return True
+                
+            except Exception as e:
+                print(f"❌ Model yükleme hatası: {e}")
+                if args.verbose:
+                    import traceback
+                    traceback.print_exc()
+                return False
     
     def load_test_data(self):
         """Test verilerini yükle"""
@@ -199,8 +221,8 @@ class QPModelTester:
         loaded_count = 0
         
         for i in range(args.num_test_samples):
+            # YENİ FORMAT: Data_i/VarFeatures.csv (Data_i/Data_i/VarFeatures.csv DEĞİL)
             instance_dir = os.path.join(args.test_data_folder, f"Data_{i}")
-            gnn_data_dir = os.path.join(instance_dir, f"Data_{i}")
             
             try:
                 # Labels yükle
@@ -219,13 +241,13 @@ class QPModelTester:
                 else:
                     labels_sol.append(np.zeros(self.n_Vars_small))
                 
-                # GNN features yükle
-                var_features = read_csv(os.path.join(gnn_data_dir, "VarFeatures.csv"), header=None).values
-                con_features = read_csv(os.path.join(gnn_data_dir, "ConFeatures.csv"), header=None).values
-                edg_features_A = read_csv(os.path.join(gnn_data_dir, "EdgeFeatures_A.csv"), header=None).values
-                edg_indices_A = read_csv(os.path.join(gnn_data_dir, "EdgeIndices_A.csv"), header=None).values
-                q_edg_features_H = read_csv(os.path.join(gnn_data_dir, "QEdgeFeatures.csv"), header=None).values
-                q_edg_indices_H = read_csv(os.path.join(gnn_data_dir, "QEdgeIndices.csv"), header=None).values
+                # GNN features yükle - YENİ FORMAT
+                var_features = read_csv(os.path.join(instance_dir, "VarFeatures.csv"), header=None).values
+                con_features = read_csv(os.path.join(instance_dir, "ConFeatures.csv"), header=None).values
+                edg_features_A = read_csv(os.path.join(instance_dir, "EdgeFeatures_A.csv"), header=None).values
+                edg_indices_A = read_csv(os.path.join(instance_dir, "EdgeIndices_A.csv"), header=None).values
+                q_edg_features_H = read_csv(os.path.join(instance_dir, "QEdgeFeatures.csv"), header=None).values
+                q_edg_indices_H = read_csv(os.path.join(instance_dir, "QEdgeIndices.csv"), header=None).values
                 
                 # Offset kenarları
                 edg_indices_A_offset = edg_indices_A + [con_node_offset, var_node_offset]
@@ -282,31 +304,27 @@ class QPModelTester:
         print(f"✅ {loaded_count} test örneği yüklendi")
         return True
     
-    def test_models(self):
-        """Modelleri test et"""
-        if not self.test_data:
-            print("❌ Test verisi yok!")
+    def test_model(self):
+        """Modeli test et"""
+        if not self.test_data or not self.model:
+            print("❌ Test verisi veya model yok!")
             return
         
-        print(f"\n🧪 Model testleri başlıyor...")
+        print(f"\n🧪 {args.model_type.upper()} Model Testi Başlıyor...")
+        print(f"{'='*50}")
         
-        for model_name, model in self.models.items():
-            print(f"\n{'='*50}")
-            print(f"🔬 {model_name.upper()} Model Testi")
-            print(f"{'='*50}")
-            
-            # Tahmin yap
-            start_time = time.time()
-            predictions = model(self.test_data['batched_states'], training=False)
-            inference_time = time.time() - start_time
-            
-            # Sonuçları değerlendir
-            if model_name == 'fea':
-                self.evaluate_feasibility(predictions, inference_time)
-            elif model_name == 'obj':
-                self.evaluate_objective(predictions, inference_time)
-            elif model_name == 'sol':
-                self.evaluate_solution(predictions, inference_time)
+        # Tahmin yap
+        start_time = time.time()
+        predictions = self.model(self.test_data['batched_states'], training=False)
+        inference_time = time.time() - start_time
+        
+        # Sonuçları değerlendir
+        if args.model_type == 'fea':
+            self.evaluate_feasibility(predictions, inference_time)
+        elif args.model_type == 'obj':
+            self.evaluate_objective(predictions, inference_time)
+        elif args.model_type == 'sol':
+            self.evaluate_solution(predictions, inference_time)
     
     def evaluate_feasibility(self, predictions, inference_time):
         """Feasibility model değerlendirmesi"""
@@ -376,76 +394,61 @@ class QPModelTester:
         y_true = np.array(self.test_data['labels_sol'])
         y_pred = predictions.numpy()
         
-        # Reshape için sample sayısını hesapla
         num_samples = self.test_data['num_samples']
         
-        print(f"🔍 Debug: y_pred shape: {y_pred.shape}")
-        print(f"🔍 Debug: num_samples: {num_samples}")
-        print(f"🔍 Debug: n_Vars_small: {self.n_Vars_small}")
-        print(f"🔍 Debug: Expected total: {num_samples * self.n_Vars_small}")
+        print(f"🔍 Debug Info:")
+        print(f"   y_pred shape: {y_pred.shape}")
+        print(f"   num_samples: {num_samples}")
+        print(f"   n_Vars_small: {self.n_Vars_small}")
+        print(f"   Expected shape: ({num_samples}, {self.n_Vars_small})")
         
-        
-        # y_pred'in boyutunu kontrol et
-        if len(y_pred.shape) == 2:
-            # Model zaten 2D array vermiş (örn: 500×10)
-            if y_pred.shape == (num_samples * self.n_Vars_small, self.n_Vars_small):
-                # Doğru boyut: reshape gerek yok, sadece yeniden boyutlandır
-                y_pred = y_pred.flatten()[:num_samples * self.n_Vars_small].reshape(num_samples, self.n_Vars_small)
-                print("✅ 2D array düzeltildi")
-            elif y_pred.shape[0] == num_samples and y_pred.shape[1] == self.n_Vars_small:
-                # Zaten doğru boyutta
-                print("✅ Zaten doğru boyutta")
+        # y_pred reshape
+        if len(y_pred.shape) == 2 and y_pred.shape[0] == num_samples:
+            # Zaten doğru boyutta
+            print("✅ Prediction shape zaten doğru")
+        elif len(y_pred.shape) == 2:
+            # 2D ama farklı boyut - ilk boyutu kontrol et
+            if y_pred.shape[0] == num_samples * self.n_Vars_small:
+                # Super-graph format: (1000*10, 10) -> (1000, 10)
+                # Her sample için ilk sütunu al
+                y_pred_reshaped = []
+                for i in range(num_samples):
+                    start_idx = i * self.n_Vars_small
+                    end_idx = (i + 1) * self.n_Vars_small
+                    # Her sample için diagonal elementi al (her variable için kendi prediction)
+                    sample_pred = []
+                    for j in range(self.n_Vars_small):
+                        sample_pred.append(y_pred[start_idx + j, j])
+                    y_pred_reshaped.append(sample_pred)
+                y_pred = np.array(y_pred_reshaped)
+                print("✅ Super-graph prediction reshape yapıldı")
             else:
-                print(f"⚠️  Beklenmeyen 2D shape: {y_pred.shape}")
-                y_pred = y_pred.flatten()[:num_samples * self.n_Vars_small].reshape(num_samples, self.n_Vars_small)
+                print(f"❌ Beklenmeyen 2D shape: {y_pred.shape}")
+                return
         else:
             # 1D array - eski mantık
-            # 1D array - eski mantık
-            total_vars_in_supergraph = y_pred.shape[0]
+            total_vars = y_pred.shape[0]
             expected_vars = num_samples * self.n_Vars_small
             
-            if total_vars_in_supergraph == expected_vars:
-                # Model doğru boyutta çıktı vermiş
-                y_pred = y_pred.flatten()[:num_samples * self.n_Vars_small].reshape(num_samples, self.n_Vars_small)
-                print("✅ Direct reshape yapıldı")
+            if total_vars >= expected_vars:
+                y_pred = y_pred[:expected_vars].reshape(num_samples, self.n_Vars_small)
+                print("✅ 1D Prediction reshape yapıldı")
             else:
-                # Model super-graph için tüm variable node'lar için tahmin yapmış
-                print(f"⚠️  Super-graph modunda: {total_vars_in_supergraph} total vars")
-            
-            # Her örnek için sadece ilgili variable'ları al
-            y_pred_filtered = []
-            for i in range(num_samples):
-                start_idx = i * self.n_Vars_small
-                end_idx = (i + 1) * self.n_Vars_small
-                
-                if end_idx <= total_vars_in_supergraph:
-                    y_pred_filtered.append(y_pred[start_idx:end_idx])
-                else:
-                    print(f"❌ Index out of range for sample {i}")
-                    # Padding veya truncation
-                    available = total_vars_in_supergraph - start_idx
-                    if available > 0:
-                        sample_pred = y_pred[start_idx:total_vars_in_supergraph]
-                        # Eksik kısmı sıfırlarla doldur
-                        padding = np.zeros(self.n_Vars_small - available)
-                        sample_pred = np.concatenate([sample_pred, padding])
-                    else:
-                        sample_pred = np.zeros(self.n_Vars_small)
-                    y_pred_filtered.append(sample_pred)
-            
-            y_pred = np.array(y_pred_filtered)
-            print(f"✅ Filtered reshape yapıldı: {y_pred.shape}")
+                print(f"❌ Prediction boyutu yetersiz: {total_vars} < {expected_vars}")
+                return
         
-        # Eğer y_true tek boyutluysa reshape et
+        # y_true reshape
         if len(y_true.shape) == 1:
             y_true = y_true.reshape(num_samples, -1)
-        elif y_true.shape[1] != self.n_Vars_small:
+        if y_true.shape[1] != self.n_Vars_small:
             y_true = y_true[:, :self.n_Vars_small]
         
-        print(f"🔍 Final shapes - y_true: {y_true.shape}, y_pred: {y_pred.shape}")
+        print(f"✅ Final shapes - y_true: {y_true.shape}, y_pred: {y_pred.shape}")
         
+        # Metrics hesapla
         mse = mean_squared_error(y_true.flatten(), y_pred.flatten())
         mae = mean_absolute_error(y_true.flatten(), y_pred.flatten())
+        rmse = np.sqrt(mse)
         
         # Per-sample MSE
         sample_mses = []
@@ -456,6 +459,7 @@ class QPModelTester:
         self.results['solution'] = {
             'mse': mse,
             'mae': mae,
+            'rmse': rmse,
             'sample_mses': sample_mses,
             'inference_time': inference_time,
             'predictions': y_pred,
@@ -465,11 +469,16 @@ class QPModelTester:
         print(f"📊 Solution Sonuçları:")
         print(f"   MSE: {mse:.6f}")
         print(f"   MAE: {mae:.6f}")
-        print(f"   RMSE: {np.sqrt(mse):.6f}")
+        print(f"   RMSE: {rmse:.6f}")
         print(f"   Per-sample MSE mean: {np.mean(sample_mses):.6f}")
         print(f"   Per-sample MSE std: {np.std(sample_mses):.6f}")
+        print(f"   Per-sample RMSE mean: {np.sqrt(np.mean(sample_mses)):.6f}")
         print(f"   Inference Time: {inference_time:.4f}s")
         print(f"   Samples per second: {num_samples/inference_time:.2f}")
+        
+        # Sample statistics
+        print(f"   Solution Range (True): [{np.min(y_true):.4f}, {np.max(y_true):.4f}]")
+        print(f"   Solution Range (Pred): [{np.min(y_pred):.4f}, {np.max(y_pred):.4f}]")
     
     def save_results(self):
         """Sonuçları kaydet"""
@@ -494,31 +503,33 @@ class QPModelTester:
     
     def run_test(self):
         """Ana test fonksiyonu"""
-        print("🚀 QP GNN Model Test Script")
-        print("="*50)
+        print("🚀 QP GNN Model Test Script - Fixed Version")
+        print("="*60)
+        print(f"Model Type: {args.model_type}")
+        print(f"Test Samples: {args.num_test_samples}")
+        print(f"Embedding Size: {args.emb_size}")
         
         # Boyutları algıla
         self.detect_data_dimensions()
         
-        # Modelleri yükle
-        self.load_models()
-        
-        if not self.models:
-            print("❌ Hiç model yüklenemedi!")
+        # Modeli yükle
+        if not self.load_model():
+            print("❌ Model yüklenemedi!")
             return
         
         # Test verilerini yükle
         if not self.load_test_data():
+            print("❌ Test verileri yüklenemedi!")
             return
         
-        # Testleri çalıştır
-        self.test_models()
+        # Testi çalıştır
+        self.test_model()
         
         # Sonuçları kaydet
         self.save_results()
         
         print(f"\n🎉 Test tamamlandı!")
-        print(f"📊 {len(self.models)} model, {self.test_data['num_samples']} örnekle test edildi")
+        print(f"📊 {args.model_type.upper()} modeli {self.test_data['num_samples']} örnekle test edildi")
 
 if __name__ == "__main__":
     tester = QPModelTester()

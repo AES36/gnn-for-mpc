@@ -1,417 +1,476 @@
+# train_fixed.py (Tamamen temiz versiyon)
 import numpy as np
-from pandas import read_csv
+from pandas import read_csv, errors as pd_errors
+import pandas as pd
 import tensorflow as tf
 import argparse
 import os
-# QPGNNPolicy modelinizi içeren dosya adını doğru bir şekilde buraya girin.
+import time
+from sklearn.model_selection import train_test_split
 from models import QPGNNPolicy
 
-## ARGUMENTS OF THE SCRIPT
-parser = argparse.ArgumentParser(description="QP GNN Modelini Eğitme Betiği.")
-parser.add_argument("--data_folder", help="Eğitim veri setinin ana klasörü", default="./train_data", type=str)
-parser.add_argument("--val_data_folder", help="Doğrulama veri setinin ana klasörü", default="./test_data", type=str)
-parser.add_argument("--total_samples", help="Toplam eğitim + doğrulama örnek sayısı", default=100, type=int)
-parser.add_argument("--num_train_samples", help="Eğitim için kullanılacak örnek sayısı", default=80, type=int)
-parser.add_argument("--num_test_samples", help="Test/doğrulama için kullanılacak örnek sayısı", default=20, type=int)
-parser.add_argument("--gpu", help="Kullanılacak GPU indeksi", default="0", type=str)
-parser.add_argument("--embSize", help="GNN'nin gömme boyutu", default=64, type=int)
-parser.add_argument("--epoch", help="Maksimum epoch sayısı", default=500, type=int)
-parser.add_argument("--type", help="Model tipi: 'fea' (fizibilite), 'obj' (amaç değeri), 'sol' (çözüm)", default="fea", choices=['fea','obj','sol'])
-parser.add_argument("--valSplit", help="Doğrulama için verinin oranı (0~1)", default=0.2, type=float)
-parser.add_argument("--dropout", help="Dropout oranı", default=0.0, type=float)
-parser.add_argument("--weightDecay", help="AdamW için ağırlık azaltma oranı", default=0.0, type=float)
-parser.add_argument("--patience", help="Erken durdurma sabrı", default=300, type=int)
-parser.add_argument("--N", help="Zaman ufku uzunluğu", default=10, type=int)
-parser.add_argument("--nx", help="Durum değişkeni sayısı", default=2, type=int)
-parser.add_argument("--nu", help="Kontrol değişkeni sayısı", default=1, type=int)
+## ARGUMENTS
+parser = argparse.ArgumentParser(description="QP GNN Model Training Script - Fixed")
+parser.add_argument("--data_folder", help="Training data folder (e.g., ./train_data)", default="./train_data", type=str)
+parser.add_argument("--total_samples", help="Total training samples to scan", default=2000, type=int)
+parser.add_argument("--val_split", help="Validation split ratio", default=0.2, type=float)
+parser.add_argument("--gpu", help="GPU index (-1 for CPU)", default="-1", type=str)
+parser.add_argument("--emb_size", help="GNN embedding size", default=32, type=int)
+parser.add_argument("--epochs", help="Maximum epochs", default=50, type=int)
+parser.add_argument("--type", help="Model type", default="fea", choices=['fea','obj','sol'])
+parser.add_argument("--lr", help="Initial learning rate", default=0.001, type=float)
+parser.add_argument("--dropout", help="Dropout rate for QPGNNPolicy", default=0.1, type=float)
+parser.add_argument("--weight_decay", help="Weight decay for AdamW", default=1e-5, type=float)
+parser.add_argument("--batch_size", help="Mini-batch size for training", default=32, type=int)
+parser.add_argument("--lr_patience", help="LR reduction patience", default=10, type=int)
+parser.add_argument("--lr_factor", help="LR reduction factor", default=0.5, type=float)
+parser.add_argument("--min_lr", help="Minimum learning rate for LR scheduler", default=1e-7, type=float)
+parser.add_argument("--verbose", help="Verbose output", action="store_true")
+parser.add_argument("--model_save_path", help="Model save directory", default="./saved_models", type=str)
+parser.add_argument("--N", help="MPC Horizon (for default dim detection)", default=10, type=int)
+parser.add_argument("--nx", help="Number of states (for default dim detection)", default=2, type=int)
+parser.add_argument("--nu", help="Number of controls (for default dim detection)", default=1, type=int)
 args = parser.parse_args()
 
-## HELPER FUNCTIONS
-def relative_loss(y_true, y_pred):
-    epsilon = 1e-6
-    return tf.reduce_mean(tf.abs(y_true - y_pred) / (tf.abs(y_true) + epsilon))
+class AdaptiveLRScheduler:
+    def __init__(self, optimizer, patience=10, factor=0.5, min_lr=1e-7, verbose=True):
+        self.optimizer = optimizer
+        self.patience = patience
+        self.factor = factor
+        self.min_lr = min_lr
+        self.wait = 0
+        self.best_loss = float('inf')
+        self.verbose = verbose
 
-def solution_mse_loss(y_true, y_pred):
-    """
-    Solution modeli için basit MSE loss.
-    Super-graph sorununu MSE ile çözüyoruz.
-    """
-    return tf.reduce_mean(tf.square(y_true - y_pred))
-
-def load_and_batch_data(folder_path, n_samples, n_Cons_small, n_Vars_small, load_solution_labels=True, model_type='fea'):
-    varFeatures_list = []
-    conFeatures_list = []
-    edgFeatures_A_list = []
-    edgIndices_A_list = []
-    q_edgFeatures_H_list = []
-    q_edgIndices_H_list = []
-    labels_list = []
-
-    var_node_offset = 0
-    con_node_offset = 0
-
-    for i in range(n_samples):
-        instance_dir = os.path.join(folder_path, f"Data_{i}")
+    def step(self, val_loss):
+        current_lr = self.optimizer.learning_rate.numpy()
+        if np.isinf(val_loss) or np.isnan(val_loss):
+            if self.verbose: 
+                print(f"  ⚠️ LR Scheduler: Geçersiz doğrulama kaybı ({val_loss}), adım atlanıyor.")
+            return False
         
-        # Fizibilite etiketini kontrol et
-        feas_path = os.path.join(instance_dir, "Labels_feas.csv")
-        if not os.path.exists(feas_path):
-            print(f"Uyarı: {feas_path} bulunamadı, örnek {i} atlanıyor.")
-            continue
-        
-        is_feasible = read_csv(feas_path, header=None).values[0,0]
+        if val_loss < self.best_loss:
+            self.best_loss = val_loss
+            self.wait = 0
+        else:
+            self.wait += 1
+            
+        if self.wait >= self.patience:
+            old_lr = current_lr
+            new_lr = max(old_lr * self.factor, self.min_lr)
+            if old_lr > new_lr:
+                self.optimizer.learning_rate.assign(new_lr)
+                self.wait = 0
+                if self.verbose:
+                    print(f"  📉 Learning rate reduced: {old_lr:.2e} → {new_lr:.2e}")
+                return True
+            elif old_lr == self.min_lr:
+                self.wait = 0
+        return False
 
-        # Eğer model 'obj' veya 'sol' ise ve problem fizibil değilse atla
-        if model_type in ["obj", "sol"] and is_feasible == 0:
-            continue
+class QPModelTrainer:
+    def __init__(self, config_args):
+        self.args = config_args
+        self.train_indices = None
+        self.val_indices = None
+        self.data_dimensions = {}
+        self.model = None
+        self.optimizer = None
+        self.lr_scheduler = None
         
-        # Label'ları oku
-        if model_type == "fea":
-            labels_data = np.array([[is_feasible]])
-        elif model_type == "obj":
-            obj_path = os.path.join(instance_dir, "Labels_obj.csv")
-            if not os.path.exists(obj_path):
-                continue 
-            labels_data = read_csv(obj_path, header=None).values
-        elif model_type == "sol":
-            solu_path = os.path.join(instance_dir, "Labels_solu.csv")
-            if not os.path.exists(solu_path):
+    def setup_gpu(self):
+        if self.args.gpu == "-1":
+            print("🖥️  Running on CPU")
+            tf.config.set_visible_devices([], 'GPU')
+            return "/CPU:0"
+        else:
+            gpu_index = int(self.args.gpu)
+            gpus = tf.config.list_physical_devices('GPU')
+            if len(gpus) > 0 and 0 <= gpu_index < len(gpus):
+                try:
+                    tf.config.set_visible_devices(gpus[gpu_index], 'GPU')
+                    tf.config.experimental.set_memory_growth(gpus[gpu_index], True)
+                    print(f"🚀 Using GPU {gpu_index}: {gpus[gpu_index].name}")
+                    return f"/GPU:{gpu_index}"
+                except Exception as e:
+                    print(f"⚠️  GPU setup failed: {e}, using CPU")
+                    tf.config.set_visible_devices([], 'GPU')
+                    return "/CPU:0"
+            else:
+                print(f"❌ GPU {gpu_index} not found or invalid. Using CPU")
+                tf.config.set_visible_devices([], 'GPU')
+                return "/CPU:0"
+
+    def detect_data_dimensions(self):
+        found_sample = False
+        for i in range(self.args.total_samples):
+            sample_dir = os.path.join(self.args.data_folder, f"Data_{i}")
+            if not os.path.isdir(sample_dir):
+                if self.args.verbose and i < 10:
+                    print(f"Dim Detect: Skipping Data_{i}, directory not found.")
                 continue
-            labels_data = read_csv(solu_path, header=None).values
+            
+            try:
+                vf_path = os.path.join(sample_dir, "VarFeatures.csv")
+                cf_path = os.path.join(sample_dir, "ConFeatures.csv")
+                efa_path = os.path.join(sample_dir, "EdgeFeatures_A.csv")
+                qefh_path = os.path.join(sample_dir, "QEdgeFeatures.csv")
 
-        # GNN dosyaları iç Data_X klasöründe
-        gnn_data_dir = os.path.join(instance_dir, f"Data_{i}")
+                if not all(os.path.exists(p) and os.path.getsize(p) > 0 for p in [vf_path, cf_path]):
+                    if self.args.verbose and i < 10:
+                        print(f"Dim Detect: Skipping Data_{i}, Var/ConFeatures missing or empty.")
+                    continue
+
+                sample_var = read_csv(vf_path, header=None)
+                sample_con = read_csv(cf_path, header=None)
+                sample_edge_A = read_csv(efa_path, header=None) if os.path.exists(efa_path) and os.path.getsize(efa_path) > 0 else pd.DataFrame(columns=range(1))
+                sample_qedge_H = read_csv(qefh_path, header=None) if os.path.exists(qefh_path) and os.path.getsize(qefh_path) > 0 else pd.DataFrame(columns=range(1))
+
+                self.data_dimensions = {
+                    'n_vars': sample_var.shape[0],
+                    'n_cons': sample_con.shape[0],
+                    'var_features': sample_var.shape[1],
+                    'con_features': sample_con.shape[1],
+                    'edge_features': sample_edge_A.shape[1] if sample_edge_A.shape[0] > 0 else 0,
+                    'qedge_features': sample_qedge_H.shape[1] if sample_qedge_H.shape[0] > 0 else 0,
+                    'N_horizon': self.args.N,
+                    'nx_dim': self.args.nx,
+                    'nu_dim': self.args.nu
+                }
+                found_sample = True
+                print(f"📊 Data dimensions detected from Data_{i}:")
+                break 
+            except pd_errors.EmptyDataError:
+                if self.args.verbose and i < 10:
+                    print(f"Dim Detect: Skipping Data_{i}, a CSV file was unexpectedly empty.")
+                continue
+            except Exception as e:
+                if self.args.verbose and i < 10:
+                    print(f"❌ Dimension detection for Data_{i} failed: {e}")
+                continue
+
+        if not found_sample:
+            print(f"❌ Dimension detection failed after {self.args.total_samples} attempts in '{self.args.data_folder}'.")
+            print(f"🔧 Using default dimensions based on args: N={self.args.N}, nx={self.args.nx}, nu={self.args.nu}.")
+            self.data_dimensions = {
+                'n_vars': self.args.N * self.args.nu,
+                'n_cons': 2 * self.args.N * self.args.nx,
+                'var_features': 3, 'con_features': 2,
+                'edge_features': 1, 'qedge_features': 1,
+                'N_horizon': self.args.N, 'nx_dim': self.args.nx, 'nu_dim': self.args.nu
+            }
         
-        # Verileri oku
+        print(f"   Variables/graph: {self.data_dimensions['n_vars']}, Constraints/graph: {self.data_dimensions['n_cons']}")
+
+    def create_train_val_split(self):
+        available_indices = []
+        for i in range(self.args.total_samples):
+            instance_dir = os.path.join(self.args.data_folder, f"Data_{i}")
+            feas_path = os.path.join(instance_dir, "Labels_feas.csv")
+            if not os.path.exists(feas_path):
+                if self.args.verbose and i < 10:
+                    print(f"Split: Skipping Data_{i}, Labels_feas.csv not found.")
+                continue
+            try:
+                is_feasible = read_csv(feas_path, header=None).values[0,0]
+                if self.args.type in ["obj", "sol"] and is_feasible == 0:
+                    if self.args.verbose and i < 10:
+                        print(f"Split: Skipping Data_{i}, infeasible for task {self.args.type}.")
+                    continue
+                
+                labels_ok = True
+                if self.args.type == "obj" and not os.path.exists(os.path.join(instance_dir, "Labels_obj.csv")):
+                    labels_ok = False
+                elif self.args.type == "sol" and not os.path.exists(os.path.join(instance_dir, "Labels_solu.csv")):
+                    labels_ok = False
+                if not labels_ok:
+                    if self.args.verbose and i < 10:
+                        print(f"Split: Skipping Data_{i}, required label for {self.args.type} not found.")
+                    continue
+                
+                required_graph_files = [
+                    "VarFeatures.csv", "ConFeatures.csv", 
+                    "EdgeIndices_A.csv", "EdgeFeatures_A.csv",
+                    "QEdgeIndices.csv", "QEdgeFeatures.csv"
+                ]
+                all_files_valid = True
+                for f_name in required_graph_files:
+                    f_path = os.path.join(instance_dir, f_name)
+                    if not os.path.exists(f_path):
+                        all_files_valid = False
+                        break
+                    if "Features" in f_name and os.path.getsize(f_path) == 0:
+                        is_essential_feature = (f_name == "VarFeatures.csv" and self.data_dimensions.get('var_features',0) > 0) or \
+                                             (f_name == "ConFeatures.csv" and self.data_dimensions.get('con_features',0) > 0) or \
+                                             (f_name == "EdgeFeatures_A.csv" and self.data_dimensions.get('edge_features',0) > 0) or \
+                                             (f_name == "QEdgeFeatures.csv" and self.data_dimensions.get('qedge_features',0) > 0)
+                        if is_essential_feature:
+                            all_files_valid = False
+                            break
+                if not all_files_valid:
+                    if self.args.verbose and i < 10:
+                        print(f"Split: Skipping Data_{i}, one or more essential graph files missing or empty.")
+                    continue
+                available_indices.append(i)
+            except Exception as e:
+                if self.args.verbose and i < 10:
+                    print(f"Split: Error processing Data_{i}: {e}")
+                continue
+        
+        if len(available_indices) == 0:
+            raise ValueError(f"No valid data samples found in '{self.args.data_folder}' for task '{self.args.type}'.")
+
+        if len(available_indices) < 2 and self.args.val_split > 0:
+             print(f"Uyarı: Çok az geçerli örnek ({len(available_indices)}). Doğrulama seti oluşturulamadı.")
+             self.train_indices = available_indices
+             self.val_indices = []
+        elif self.args.val_split == 0:
+            self.train_indices = available_indices
+            self.val_indices = []
+        else:
+            self.train_indices, self.val_indices = train_test_split(
+                available_indices, test_size=self.args.val_split, random_state=42, shuffle=True)
+
+        print(f"📊 Data split: Total {len(available_indices)}, Train {len(self.train_indices)}, Val {len(self.val_indices)}")
+
+    def load_batch_data(self, indices):
+        if not indices:
+            return None
+        varFeatures_list, conFeatures_list, edgFeatures_A_list, edgIndices_A_list, \
+        q_edgFeatures_H_list, q_edgIndices_H_list, labels_list = [[] for _ in range(7)]
+        var_node_offset, con_node_offset = 0, 0
+
+        for i in indices:
+            instance_dir = os.path.join(self.args.data_folder, f"Data_{i}")
+            try:
+                if self.args.type == "fea":
+                    labels_data = np.array([[read_csv(os.path.join(instance_dir, "Labels_feas.csv"), header=None).values[0,0]]], dtype=np.float32)
+                elif self.args.type == "obj":
+                    labels_data = read_csv(os.path.join(instance_dir, "Labels_obj.csv"), header=None).values.astype(np.float32)
+                elif self.args.type == "sol":
+                    labels_data = read_csv(os.path.join(instance_dir, "Labels_solu.csv"), header=None).values.astype(np.float32)
+                else:
+                    continue
+
+                vf = read_csv(os.path.join(instance_dir, "VarFeatures.csv"), header=None).values
+                cf = read_csv(os.path.join(instance_dir, "ConFeatures.csv"), header=None).values
+                
+                efa_path = os.path.join(instance_dir, "EdgeFeatures_A.csv")
+                eia_path = os.path.join(instance_dir, "EdgeIndices_A.csv")
+                qefh_path = os.path.join(instance_dir, "QEdgeFeatures.csv")
+                qeih_path = os.path.join(instance_dir, "QEdgeIndices.csv")
+
+                efa = read_csv(efa_path, header=None).values if os.path.exists(efa_path) and os.path.getsize(efa_path)>0 else np.empty((0,self.data_dimensions['edge_features']))
+                eia = read_csv(eia_path, header=None).values if os.path.exists(eia_path) and os.path.getsize(eia_path)>0 else np.empty((0,2))
+                qefh = read_csv(qefh_path, header=None).values if os.path.exists(qefh_path) and os.path.getsize(qefh_path)>0 else np.empty((0,self.data_dimensions['qedge_features']))
+                qeih = read_csv(qeih_path, header=None).values if os.path.exists(qeih_path) and os.path.getsize(qeih_path)>0 else np.empty((0,2))
+
+                edg_indices_A_offset = eia + [con_node_offset, var_node_offset] if eia.shape[0]>0 else eia
+                q_edg_indices_H_offset = qeih + [var_node_offset, var_node_offset] if qeih.shape[0]>0 else qeih
+
+                varFeatures_list.append(vf)
+                conFeatures_list.append(cf)
+                edgFeatures_A_list.append(efa)
+                edgIndices_A_list.append(edg_indices_A_offset)
+                q_edgFeatures_H_list.append(qefh)
+                q_edgIndices_H_list.append(q_edg_indices_H_offset)
+                labels_list.append(labels_data)
+
+                var_node_offset += vf.shape[0]
+                con_node_offset += cf.shape[0]
+            except Exception as e:
+                if self.args.verbose:
+                    print(f"⚠️ Failed to load/process Data_{i} in batch: {e}")
+                continue
+        
+        if not varFeatures_list:
+            return None
+
+        varFeatures_all = np.vstack(varFeatures_list)
+        conFeatures_all = np.vstack(conFeatures_list) if conFeatures_list else np.empty((0, self.data_dimensions['con_features']))
+        edgFeatures_A_all = np.vstack(edgFeatures_A_list) if edgFeatures_A_list and any(item.shape[0]>0 for item in edgFeatures_A_list) else np.empty((0,self.data_dimensions['edge_features']))
+        edgIndices_A_all = np.vstack(edgIndices_A_list) if edgIndices_A_list and any(item.shape[0]>0 for item in edgIndices_A_list) else np.empty((0,2))
+        q_edgFeatures_H_all = np.vstack(q_edgFeatures_H_list) if q_edgFeatures_H_list and any(item.shape[0]>0 for item in q_edgFeatures_H_list) else np.empty((0,self.data_dimensions['qedge_features']))
+        q_edgIndices_H_all = np.vstack(q_edgIndices_H_list) if q_edgIndices_H_list and any(item.shape[0]>0 for item in q_edgIndices_H_list) else np.empty((0,2))
+        labels_all = np.vstack(labels_list)
+
+        batch_data_tuple = (
+            tf.constant(conFeatures_all, dtype=tf.float32),
+            tf.transpose(tf.constant(edgIndices_A_all, dtype=tf.int32)),
+            tf.constant(edgFeatures_A_all, dtype=tf.float32),
+            tf.constant(varFeatures_all, dtype=tf.float32),
+            tf.transpose(tf.constant(q_edgIndices_H_all, dtype=tf.int32)),
+            tf.constant(q_edgFeatures_H_all, dtype=tf.float32),
+            tf.constant(con_node_offset, dtype=tf.int32),
+            tf.constant(var_node_offset, dtype=tf.int32),
+            tf.constant(self.data_dimensions['n_cons'], dtype=tf.int32),
+            tf.constant(self.data_dimensions['n_vars'], dtype=tf.int32),
+            tf.constant(labels_all, dtype=tf.float32)
+        )
+        return batch_data_tuple
+    
+    def create_model(self):
+        output_units = 1
+        output_activation_str = None
+        if self.args.type == "fea":
+            output_activation_str = 'sigmoid'
+        elif self.args.type == "sol":
+            output_units = self.data_dimensions['n_vars']
+            output_activation_str = None
+        elif self.args.type == "obj":
+            output_units = 1
+            output_activation_str = None
+        
+        self.model = QPGNNPolicy(
+            emb_size=self.args.emb_size,
+            cons_nfeats=self.data_dimensions['con_features'],
+            edge_nfeats=self.data_dimensions['edge_features'],
+            var_nfeats=self.data_dimensions['var_features'],
+            qedge_nfeats=self.data_dimensions['qedge_features'],
+            is_graph_level=(self.args.type != "sol"),
+            output_units=output_units,
+            output_activation=output_activation_str,
+            dropout_rate=self.args.dropout
+        )
+        
         try:
-            var_features = read_csv(os.path.join(gnn_data_dir, "VarFeatures.csv"), header=None).values
-            con_features = read_csv(os.path.join(gnn_data_dir, "ConFeatures.csv"), header=None).values
-            edg_features_A = read_csv(os.path.join(gnn_data_dir, "EdgeFeatures_A.csv"), header=None).values
-            edg_indices_A = read_csv(os.path.join(gnn_data_dir, "EdgeIndices_A.csv"), header=None).values
-            q_edg_features_H = read_csv(os.path.join(gnn_data_dir, "QEdgeFeatures.csv"), header=None).values
-            q_edg_indices_H = read_csv(os.path.join(gnn_data_dir, "QEdgeIndices.csv"), header=None).values
-        except FileNotFoundError as e:
-            print(f"Hata: {e}. Örnek {i} için dosya bulunamadı, atlanıyor.")
-            continue
+            self.optimizer = tf.keras.optimizers.AdamW(
+                learning_rate=self.args.lr, 
+                weight_decay=self.args.weight_decay
+            )
+        except AttributeError:
+            print("Uyarı: tf.keras.optimizers.AdamW bulunamadı. Adam kullanılıyor.")
+            self.optimizer = tf.keras.optimizers.Adam(learning_rate=self.args.lr)
+
+        self.lr_scheduler = AdaptiveLRScheduler(
+            self.optimizer, 
+            patience=self.args.lr_patience, 
+            factor=self.args.lr_factor, 
+            min_lr=self.args.min_lr, 
+            verbose=self.args.verbose
+        )
         
-        # Boyut kontrolleri
-        if (var_features.shape[0] != n_Vars_small or 
-            con_features.shape[0] != n_Cons_small or 
-            edg_indices_A.shape[0] != n_Cons_small * n_Vars_small or
-            q_edg_indices_H.shape[0] != n_Vars_small * n_Vars_small):
-            print(f"Uyarı: Örnek {i} için beklenen boyutlar eşleşmiyor, atlanıyor.")
-            print(f"Beklenen: var_feats={n_Vars_small}, con_feats={n_Cons_small}, A_edges={n_Cons_small*n_Vars_small}, H_edges={n_Vars_small*n_Vars_small}")
-            print(f"Bulunan: var_feats={var_features.shape[0]}, con_feats={con_features.shape[0]}, A_edges={edg_indices_A.shape[0]}, H_edges={q_edg_indices_H.shape[0]}")
-            continue
+        print(f"🔧 Model '{self.args.type}' oluşturuldu. Emb: {self.args.emb_size}, Out: {output_units}")
 
-        # Kenar indekslerini kaydır (super-graph için)
-        edg_indices_A_offset = edg_indices_A + [con_node_offset, var_node_offset]
-        q_edg_indices_H_offset = q_edg_indices_H + [var_node_offset, var_node_offset]
-
-        varFeatures_list.append(var_features)
-        conFeatures_list.append(con_features)
-        edgFeatures_A_list.append(edg_features_A)
-        edgIndices_A_list.append(edg_indices_A_offset)
-        q_edgFeatures_H_list.append(q_edg_features_H)
-        q_edgIndices_H_list.append(q_edg_indices_H_offset)
-        labels_list.append(labels_data)
-
-        # Ofsetleri güncelle
-        var_node_offset += var_features.shape[0]
-        con_node_offset += con_features.shape[0]
-    
-    if not varFeatures_list:
-        print(f"Uyarı: {folder_path} klasöründen hiç geçerli veri yüklenemedi. Program sonlandırılıyor.")
-        exit(1)
-
-    # Tüm listeleri birleştir
-    varFeatures_all = np.vstack(varFeatures_list)
-    conFeatures_all = np.vstack(conFeatures_list)
-    edgFeatures_A_all = np.vstack(edgFeatures_A_list)
-    edgIndices_A_all = np.vstack(edgIndices_A_list)
-    q_edgFeatures_H_all = np.vstack(q_edgFeatures_H_list)
-    q_edgIndices_H_all = np.vstack(q_edgIndices_H_list)
-    labels_all = np.vstack(labels_list)
-
-    # TensorFlow tensörlerine dönüştür
-    varFeatures_tf = tf.constant(varFeatures_all, dtype=tf.float32)
-    conFeatures_tf = tf.constant(conFeatures_all, dtype=tf.float32)
-    edgFeatures_A_tf = tf.constant(edgFeatures_A_all, dtype=tf.float32)
-    edgIndices_A_tf = tf.transpose(tf.constant(edgIndices_A_all, dtype=tf.int32))
-    q_edgFeatures_H_tf = tf.constant(q_edgFeatures_H_all, dtype=tf.float32)
-    q_edgIndices_H_tf = tf.transpose(tf.constant(q_edgIndices_H_all, dtype=tf.int32))
-    labels_tf = tf.constant(labels_all, dtype=tf.float32)
-
-    # Batch boyutları
-    n_cons_total_batch = tf.constant(conFeatures_all.shape[0], dtype=tf.int32)
-    n_vars_total_batch = tf.constant(varFeatures_all.shape[0], dtype=tf.int32)
-
-    dataloader_tuple = (
-        conFeatures_tf, edgIndices_A_tf, edgFeatures_A_tf,
-        varFeatures_tf, q_edgIndices_H_tf, q_edgFeatures_H_tf,
-        n_cons_total_batch, n_vars_total_batch,
-        tf.constant(n_Cons_small, dtype=tf.int32),
-        tf.constant(n_Vars_small, dtype=tf.int32),
-        labels_tf
-    )
-    return dataloader_tuple
-
-def process_train_step(model, dataloader, optimizer, type='fea'):
-    c, ei, ev, v, qi, qv, n_cs, n_vs, n_csm, n_vsm, cand_scores = dataloader
-    batched_states = (c, ei, ev, v, qi, qv, n_cs, n_vs, n_csm, n_vsm)
-
-    with tf.GradientTape() as tape:
-        logits = model(batched_states, training=True)
-        
-        if type == "obj":
-            loss = relative_loss(cand_scores, logits)
-        elif type == "sol":
-            # Solution için basit MSE loss kullan
-            loss = solution_mse_loss(cand_scores, logits)
-        else: # type == "fea"
-            loss = tf.reduce_mean(tf.square(cand_scores - logits))
-    
-    grads = tape.gradient(loss, model.trainable_variables)
-    optimizer.apply_gradients(zip(grads, model.trainable_variables))
-
-    err_rate = None
-    if type == "fea":
-        logits_sigmoid = tf.sigmoid(logits).numpy()
-        cand_scores_np = cand_scores.numpy()
-        
-        errs_fp = np.sum((logits_sigmoid > 0.5) & (cand_scores_np < 0.5))
-        errs_fn = np.sum((logits_sigmoid < 0.5) & (cand_scores_np > 0.5))
-        total_errs = errs_fp + errs_fn
-        err_rate = total_errs / cand_scores_np.shape[0]
-
-    return loss.numpy(), err_rate
-
-def process_eval(model, dataloader, type='fea'):
-    c, ei, ev, v, qi, qv, n_cs, n_vs, n_csm, n_vsm, cand_scores = dataloader
-    batched_states = (c, ei, ev, v, qi, qv, n_cs, n_vs, n_csm, n_vsm)
-    
-    logits = model(batched_states, training=False)
-    
-    if type == "obj":
-        loss = relative_loss(cand_scores, logits)
-    elif type == "sol":
-        # Solution için basit MSE loss kullan
-        loss = solution_mse_loss(cand_scores, logits)
-    else: # type == "fea"
-        loss = tf.reduce_mean(tf.square(cand_scores - logits))
-
-    err_rate = None
-    if type == "fea":
-        logits_sigmoid = tf.sigmoid(logits).numpy()
-        cand_scores_np = cand_scores.numpy()
-        errs_fp = np.sum((logits_sigmoid > 0.5) & (cand_scores_np < 0.5))
-        errs_fn = np.sum((logits_sigmoid < 0.5) & (cand_scores_np > 0.5))
-        total_errs = errs_fp + errs_fn
-        err_rate = total_errs / cand_scores_np.shape[0]
-        
-    return loss.numpy(), err_rate
-
-## SETUP HYPERPARAMETERS
-max_epochs = args.epoch
-lr = 0.0003
-seed = 0
-val_split = args.valSplit
-weight_decay = args.weightDecay
-dropout_rate = args.dropout
-patience = args.patience
-
-## DATASET SETUP
-trainfolder = args.data_folder
-valfolder = args.val_data_folder
-
-# Gerçek veri boyutlarını otomatik algıla
-sample_gnn_dir = os.path.join(args.data_folder, "Data_0", "Data_0")
-try:
-    sample_var = read_csv(os.path.join(sample_gnn_dir, "VarFeatures.csv"), header=None)
-    sample_con = read_csv(os.path.join(sample_gnn_dir, "ConFeatures.csv"), header=None)
-    sample_edge_A = read_csv(os.path.join(sample_gnn_dir, "EdgeIndices_A.csv"), header=None)
-    sample_qedge_H = read_csv(os.path.join(sample_gnn_dir, "QEdgeIndices.csv"), header=None)
-    
-    n_Vars_small = sample_var.shape[0]
-    n_Cons_small = sample_con.shape[0]
-    n_Eles_small_A = sample_edge_A.shape[0]
-    n_Eles_small_H = sample_qedge_H.shape[0]
-    
-    print(f'Gerçek veri boyutları (otomatik algılandı):')
-    print(f'  Variables per graph: {n_Vars_small}')
-    print(f'  Constraints per graph: {n_Cons_small}')
-    print(f'  A edges per graph: {n_Eles_small_A}')
-    print(f'  H edges per graph: {n_Eles_small_H}')
-    
-except FileNotFoundError as e:
-    print(f"Uyarı: Otomatik boyut algılama başarısız: {e}")
-    print("Manuel boyutlar kullanılıyor...")
-    n_Vars_small = 10
-    n_Cons_small = 40
-    n_Eles_small_A = 400
-    n_Eles_small_H = 100
-
-## LOAD DATASET INTO MEMORY
-train_dataloader = load_and_batch_data(
-    args.data_folder, args.num_train_samples, n_Cons_small, n_Vars_small, 
-    load_solution_labels=True, model_type=args.type
-)
-val_dataloader = load_and_batch_data(
-    args.val_data_folder, args.num_test_samples, n_Cons_small, n_Vars_small, 
-    load_solution_labels=True, model_type=args.type
-)
-
-if train_dataloader is None or val_dataloader is None:
-    print("Hata: Veri yükleme başarısız oldu.")
-    exit(1)
-
-print('Train data shapes (after loading and batching):')
-print(f'  Constraint features: {train_dataloader[0].shape}')
-print(f'  Edge indices A: {train_dataloader[1].shape}')
-print(f'  Edge features A: {train_dataloader[2].shape}')
-print(f'  Variable features: {train_dataloader[3].shape}')
-print(f'  QEdge indices H: {train_dataloader[4].shape}')
-print(f'  QEdge features H: {train_dataloader[5].shape}')
-print(f'  Total constraints in batch: {train_dataloader[6].numpy()}')
-print(f'  Total variables in batch: {train_dataloader[7].numpy()}')
-print(f'  Constraints per graph: {train_dataloader[8].numpy()}')
-print(f'  Variables per graph: {train_dataloader[9].numpy()}')
-print(f'  Labels: {train_dataloader[10].shape}')
-
-print('\nValidation data shapes:')
-print(f'  Constraint features: {val_dataloader[0].shape}')
-print(f'  Edge indices A: {val_dataloader[1].shape}')
-print(f'  Edge features A: {val_dataloader[2].shape}')
-print(f'  Variable features: {val_dataloader[3].shape}')
-print(f'  QEdge indices H: {val_dataloader[4].shape}')
-print(f'  QEdge features H: {val_dataloader[5].shape}')
-print(f'  Total constraints in batch: {val_dataloader[6].numpy()}')
-print(f'  Total variables in batch: {val_dataloader[7].numpy()}')
-print(f'  Constraints per graph: {val_dataloader[8].numpy()}')
-print(f'  Variables per graph: {val_dataloader[9].numpy()}')
-print(f'  Labels: {val_dataloader[10].shape}')
-
-# Feature boyutlarını al
-sample_dir = os.path.join(args.data_folder, "Data_0", "Data_0")
-try:
-    sample_var = read_csv(os.path.join(sample_dir, "VarFeatures.csv"), header=None)
-    sample_con = read_csv(os.path.join(sample_dir, "ConFeatures.csv"), header=None)
-    sample_edge_A = read_csv(os.path.join(sample_dir, "EdgeFeatures_A.csv"), header=None)
-    sample_qedge_H = read_csv(os.path.join(sample_dir, "QEdgeFeatures.csv"), header=None)
-    
-    nVarF = sample_var.shape[1]
-    nConsF = sample_con.shape[1] 
-    nEdgeF = sample_edge_A.shape[1]
-    nQEdgeF = sample_qedge_H.shape[1]
-    
-    print(f'\nFeature dimensions:')
-    print(f'  Variable features: {nVarF}')
-    print(f'  Constraint features: {nConsF}')
-    print(f'  Edge features A: {nEdgeF}')
-    print(f'  QEdge features H: {nQEdgeF}')
-    
-except FileNotFoundError:
-    nVarF = 4
-    nConsF = 4
-    nEdgeF = 1
-    nQEdgeF = 1
-
-## SETUP MODEL
-if not os.path.exists('./saved-models/'):
-    os.makedirs('./saved-models/')
-model_path = './saved-models/qp_' + args.type + '_s' + str(args.embSize) + '.pkl'
-
-# Model parameters
-output_units = 1
-output_activation = None
-
-if args.type == "fea":
-    output_activation = 'sigmoid'
-elif args.type == "sol":
-    output_units = n_Vars_small
-    output_activation = None
-elif args.type == "obj":
-    output_units = 1
-    output_activation = None
-
-## SETUP TENSORFLOW GPU
-tf.random.set_seed(seed)
-gpu_index = int(args.gpu)
-tf.config.set_soft_device_placement(True)
-gpus = tf.config.list_physical_devices('GPU')
-if len(gpus) > 0:
-    try:
-        tf.config.set_visible_devices(gpus[gpu_index], 'GPU')
-        tf.config.experimental.set_memory_growth(gpus[gpu_index], True)
-        print(f"GPU {gpu_index} yapılandırıldı: {gpus[gpu_index].name}")
-    except RuntimeError as e:
-        print(f"GPU ayarı atlandı (zaten yapılandırılmış): {e}")
-else:
-    print("GPU bulunamadı, CPU kullanılacak")
-
-## MAIN TRAINING LOOP
-with tf.device("GPU:" + str(gpu_index) if len(gpus) > 0 else "/CPU:0"):
-    # Create model
-    model = QPGNNPolicy(
-        emb_size=args.embSize,
-        cons_nfeats=nConsF,
-        edge_nfeats=nEdgeF,
-        var_nfeats=nVarF,
-        qedge_nfeats=nQEdgeF,
-        is_graph_level=(args.type != "sol"),
-        output_units=output_units,
-        output_activation=output_activation,
-        dropout_rate=dropout_rate
-    )
-    
-    # Optimizer
-    try:
-        optimizer = tf.keras.optimizers.AdamW(learning_rate=lr, weight_decay=weight_decay)
-    except AttributeError:
-        print("AdamW optimizer not available, using standard Adam optimizer")
-        optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-
-    # Early stopping variables
-    best_val_loss = float('inf')
-    wait = 0
-    best_epoch = 0
-
-    print(f"\n🚀 Eğitim başlıyor...")
-    print(f"Model tipi: {args.type}")
-    print(f"Embedding boyutu: {args.embSize}")
-    print(f"Maksimum epoch: {max_epochs}")
-    print(f"Sabır (patience): {patience}")
-    print("-" * 80)
-
-    # Training loop
-    for epoch in range(max_epochs):
-        # Train step
-        train_loss, train_err = process_train_step(model, train_dataloader, optimizer, type=args.type)
-        
-        # Validation step
-        val_loss, val_err = process_eval(model, val_dataloader, type=args.type)
-        
-        # Print progress
-        if args.type == "fea":
-            print(f"Epoch {epoch:4d}: Train Loss={train_loss:.6f}, Train Err={train_err:.4f}, "
-                  f"Val Loss={val_loss:.6f}, Val Err={val_err:.4f}")
+    def compute_loss(self, y_true, y_pred):
+        if self.args.type == "fea":
+            # Binary crossentropy - basit versiyon
+            loss = tf.nn.sigmoid_cross_entropy_with_logits(labels=y_true, logits=y_pred)
+        elif self.args.type == "obj":
+            # Relative absolute error
+            epsilon = 1e-7
+            loss = tf.abs(y_true - y_pred) / (tf.abs(y_true) + epsilon)
+        elif self.args.type == "sol":
+            # Mean squared error
+            loss = tf.square(y_true - y_pred)
         else:
-            print(f"Epoch {epoch:4d}: Train Loss={train_loss:.6f}, Val Loss={val_loss:.6f}")
+            raise ValueError(f"Bilinmeyen tip: {self.args.type}")
+        return tf.reduce_mean(loss)
 
-        # Check for improvement and save best model
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            wait = 0
-            best_epoch = epoch
-            model.save_state(model_path)
-            print(f"  ✓ Saved best model at epoch {epoch} with val_loss={val_loss:.6f}")
-        else:
-            wait += 1
-            if wait >= patience:
-                print(f"  ✗ Early stopping after {patience} epochs without improvement")
-                print(f"  ✓ Best model was at epoch {best_epoch} with val_loss={best_val_loss:.6f}")
-                break
+    @tf.function
+    def train_step(self, model_inputs, labels):
+        with tf.GradientTape() as tape:
+            predictions = self.model(model_inputs, training=True)
+            loss = self.compute_loss(labels, predictions)
+        gradients = tape.gradient(loss, self.model.trainable_variables)
+        self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+        return loss
 
-    print("-" * 80)
-    print(f"🎉 Eğitim tamamlandı!")
-    print(f"En iyi doğrulama kaybı: {best_val_loss:.6f} (epoch {best_epoch})")
+    def val_step(self, model_inputs, labels):
+        predictions = self.model(model_inputs, training=False)
+        loss = self.compute_loss(labels, predictions)
+        return loss
+
+    def train(self):
+        print("📂 Mini-batch eğitim sistemi başlatılıyor...")
+        
+        # Model kayıt yolu
+        model_base_name = f"qp_{self.args.type}_emb{self.args.emb_size}_N{self.data_dimensions['N_horizon']}nx{self.data_dimensions['nx_dim']}nu{self.data_dimensions['nu_dim']}"
+        model_checkpoint_prefix = os.path.join(self.args.model_save_path, model_base_name, "ckpt")
+        os.makedirs(os.path.dirname(model_checkpoint_prefix), exist_ok=True)
+        
+        # Checkpoint oluştur
+        checkpoint = tf.train.Checkpoint(model=self.model, optimizer=self.optimizer)
+
+        print(f"\n🚀 Eğitim Başlatılıyor: Tip={self.args.type}, Epoch={self.args.epochs}")
+        print(f"   Train samples: {len(self.train_indices)}, Batch size: {self.args.batch_size}")
+        print(f"   Batches per epoch: {len(self.train_indices) // self.args.batch_size + (1 if len(self.train_indices) % self.args.batch_size != 0 else 0)}")
+        print(f"   Model kaydedilecek prefix: {model_checkpoint_prefix}")
+        
+        for epoch in range(self.args.epochs):
+            epoch_start_time = time.time()
+            
+            # Training indices'leri karıştır
+            np.random.shuffle(self.train_indices)
+            
+            epoch_train_losses = []
+            
+            # Mini-batch training
+            for batch_start in range(0, len(self.train_indices), self.args.batch_size):
+                batch_end = min(batch_start + self.args.batch_size, len(self.train_indices))
+                batch_indices = self.train_indices[batch_start:batch_end]
+                
+                # Batch verilerini yükle
+                batch_data = self.load_batch_data(batch_indices)
+                if batch_data is None:
+                    continue
+                
+                # Training step
+                batch_loss = self.train_step(batch_data[:-1], batch_data[-1])
+                epoch_train_losses.append(batch_loss.numpy())
+            
+            # Epoch train loss ortalaması
+            avg_train_loss = np.mean(epoch_train_losses) if epoch_train_losses else float('inf')
+            
+            # Validation loss hesapla
+            if self.val_indices:
+                val_data = self.load_batch_data(self.val_indices)
+                if val_data is not None:
+                    val_loss = self.val_step(val_data[:-1], val_data[-1])
+                    val_loss_numpy = val_loss.numpy()
+                else:
+                    val_loss_numpy = float('inf')
+            else:
+                if epoch == 0:
+                    print("Uyarı: Doğrulama seti yok. LR zamanlayıcı eğitim kaybını kullanacak.")
+                val_loss_numpy = avg_train_loss
+
+            # Learning rate scheduler
+            self.lr_scheduler.step(val_loss_numpy)
+            current_lr_val = self.optimizer.learning_rate.numpy()
+            epoch_duration = time.time() - epoch_start_time
+
+            print(f"Epoch {epoch+1:4d}/{self.args.epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {val_loss_numpy:.6f} | LR: {current_lr_val:.2e} | Süre: {epoch_duration:.1f}s | Batches: {len(epoch_train_losses)}")
+            
+            # Her 10 epoch'ta bir veya son epoch'ta modeli kaydet
+            if (epoch + 1) % 10 == 0 or epoch + 1 == self.args.epochs:
+                try:
+                    checkpoint.save(model_checkpoint_prefix)
+                    print(f"  ✓ Model ağırlıkları kaydedildi (Epoch {epoch+1})")
+                except Exception as e_save:
+                    print(f"  ⚠️ Model ağırlıklarını kaydederken hata: {e_save}")
+
+        print("-" * 70)
+        print("🎉 Eğitim tamamlandı!")
+        print(f"Son model ağırlıkları {model_checkpoint_prefix} adresine kaydedildi.")
+
+    def run(self):
+        print("🚀 QP GNN Model Training - Mini-Batch Versiyon")
+        print("=" * 60)
+        print("Argümanlar:", vars(self.args))
+
+        target_device = self.setup_gpu()
+        self.detect_data_dimensions()
+        self.create_train_val_split()
+
+        if not self.train_indices:
+            print("❌ Eğitim için geçerli örnek bulunamadı. Program sonlandırılıyor.")
+            return
+
+        with tf.device(target_device):
+            self.create_model()
+            self.train()
+
+if __name__ == "__main__":
+    trainer = QPModelTrainer(args)
+    trainer.run()
